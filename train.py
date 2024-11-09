@@ -1,6 +1,8 @@
 from __future__ import absolute_import
 from __future__ import print_function
 
+import csv
+
 import os
 import sys
 import time
@@ -16,10 +18,10 @@ import matplotlib.pyplot as plt
 import mlflow
 import uuid
 import warnings
+from glob import glob
 warnings.filterwarnings("ignore")
 METRIC_THRESHOLD = 3000000
 
-# we need to import python modules from the $SUMO_HOME/tools directory
 if "SUMO_HOME" in os.environ:
     tools = os.path.join(os.environ["SUMO_HOME"], "tools")
     sys.path.append(tools)
@@ -28,6 +30,70 @@ else:
 
 from sumolib import checkBinary  # noqa
 import traci  # noqa
+
+import pandas as pd
+
+def save_and_register_model(agent, model_name):
+    """
+    Save the trained model and register it with MLflow.
+    """
+    # Define the model path
+    model_path = f'models/{model_name}.bin'
+    os.makedirs('models', exist_ok=True)
+
+    # Save the model
+    torch.save(agent.Q_eval.state_dict(), model_path)
+    print(f"Model saved at {model_path}")
+
+    # Start MLflow run and log the model
+    
+    mlflow.pytorch.log_model(agent.Q_eval, artifact_path="models")
+    mlflow.register_model(f"runs:/{mlflow.active_run().info.run_id}/models", "TrafficLightModel")
+
+
+def preprocess_chunk(chunk):
+    chunk['state'] = chunk['state'].apply(eval)  # Convert string to list
+    chunk['next_state'] = chunk['next_state'].apply(eval)
+    chunk['done'] = chunk['done'].astype(bool)   # Convert 'done' column to boolean
+    return chunk
+
+def train_historical(agent, model_name, folder_path='data', chunksize = 100000, batch_size = 64):
+    csv_files = glob(os.path.join(folder_path, "*.csv"))
+    if not csv_files:
+        print("No CSV files found in the specified folder.")
+        return pd.DataFrame()  # Return an empty DataFrame if no files are found
+    for file_path in csv_files:
+        print(f"Loading data from: {file_path}")
+        # Read the CSV file in chunks
+        for chunk in pd.read_csv(file_path, chunksize=chunksize):
+            # Preprocess the chunk
+            chunk = preprocess_chunk(chunk)
+            chunk = chunk.sample(frac=0.7).reset_index(drop=True)
+            for i in range(0, len(chunk), batch_size):
+                batch = chunk.iloc[i:i + batch_size]
+
+                # Extract batch data
+                states = torch.tensor(batch['state'].tolist(), dtype=torch.float).to(agent.Q_eval.device)
+                actions = torch.tensor(batch['action'].values, dtype=torch.long).to(agent.Q_eval.device)
+                rewards = torch.tensor(batch['reward'].values, dtype=torch.float).to(agent.Q_eval.device)
+                next_states = torch.tensor(batch['next_state'].tolist(), dtype=torch.float).to(agent.Q_eval.device)
+                dones = torch.tensor(batch['done'].values, dtype=torch.bool).to(agent.Q_eval.device)
+
+                # Training step
+                q_eval = agent.Q_eval(states)[range(len(batch)), actions]
+                q_next = agent.Q_eval(next_states)
+                q_next[dones] = 0.0
+
+                q_target = rewards + agent.gamma * torch.max(q_next, dim=1)[0]
+                loss = agent.Q_eval.loss(q_target, q_eval).to(agent.Q_eval.device)
+
+                agent.Q_eval.optimizer.zero_grad()
+                loss.backward()
+                agent.Q_eval.optimizer.step()
+
+    save_and_register_model(agent, model_name)
+
+
 
 def get_vehicle_numbers(lanes):
     vehicle_per_lane = dict()
@@ -130,7 +196,7 @@ class Agent:
             }
 
 
-    def store_transition(self, state, state_, action,reward, done,junction):
+    def store_transition(self, state, state_, action,reward, done,junction, model_name):
         index = self.memory[junction]["mem_cntr"] % self.max_mem
         self.memory[junction]["state_memory"][index] = state
         self.memory[junction]["new_state_memory"][index] = state_
@@ -138,6 +204,15 @@ class Agent:
         self.memory[junction]['terminal_memory'][index] = done
         self.memory[junction]["action_memory"][index] = action
         self.memory[junction]["mem_cntr"] += 1
+        file_exists = os.path.isfile(os.path.join("data", f'{model_name}.csv'))
+        header = ['junction', 'state', 'action', 'reward', 'next_state', 'done']
+        row = [junction, state, action, reward, state_, done]
+
+        with open(os.path.join("data", f'{model_name}.csv'), 'a', newline='') as file:
+            writer = csv.writer(file)
+            if not file_exists:
+                writer.writerow(header)
+            writer.writerow(row)
 
     def choose_action(self, observation):
         state = torch.tensor([observation], dtype=torch.float).to(self.Q_eval.device)
@@ -188,7 +263,7 @@ class Agent:
         )
 
 
-def run(train=True,model_name="model",epochs=50,steps=500,ard=False):
+def run(train=True,model_name="model",epochs=50,steps=500,ard=False, historical = False):
   print(checkBinary("sumo"))
   with mlflow.start_run():
     if ard:
@@ -221,114 +296,117 @@ def run(train=True,model_name="model",epochs=50,steps=500,ard=False):
         n_actions=4,
         junctions=junction_numbers,
     )
-
-    if not train:
-        brain.Q_eval = mlflow.pytorch.load_model("models:/TrafficLightModel/latest")
-        # brain.Q_eval.load_state_dict(torch.load(f'models/{model_name}.bin',map_location=brain.Q_eval.device))
-
     print(brain.Q_eval.device)
     traci.close()
-    for e in range(epochs):
-        if train:
-            traci.start(
-            [checkBinary("sumo"), "-c", "configuration.sumocfg", "--tripinfo-output", "tripinfo.xml"]
-            )
-        else:
-            traci.start(
-            [checkBinary("sumo"), "-c", "configuration.sumocfg", "--tripinfo-output", "tripinfo.xml"]
-            )
-
-        print(f"epoch: {e}")
-        select_lane = [
-            ["yyyrrrrrrrrr", "GGGrrrrrrrrr"],
-            ["rrryyyrrrrrr", "rrrGGGrrrrrr"],
-            ["rrrrrryyyrrr", "rrrrrrGGGrrr"],
-            ["rrrrrrrrryyy", "rrrrrrrrrGGG"],
-        ]
-
-        # select_lane = [
-        #     ["yyyyrrrrrrrrrrrr", "GGGGrrrrrrrrrrrr"],
-        #     ["rrrryyyyrrrrrrrr", "rrrrGGGGrrrrrrrr"],
-        #     ["rrrrrrrryyyyrrrr", "rrrrrrrrGGGGrrrr"],
-        #     ["rrrrrrrrrrrryyyy", "rrrrrrrrrrrrGGGG"],
-        # ]
-
-        step = 0
-        total_time = 0
-        min_duration = 5
-        
-        traffic_lights_time = dict()
-        prev_wait_time = dict()
-        prev_vehicles_per_lane = dict()
-        prev_action = dict()
-        all_lanes = list()
-        
-        for junction_number, junction in enumerate(all_junctions):
-            prev_wait_time[junction] = 0
-            prev_action[junction_number] = 0
-            traffic_lights_time[junction] = 0
-            prev_vehicles_per_lane[junction_number] = [0] * 4
-            # prev_vehicles_per_lane[junction_number] = [0] * (len(all_junctions) * 4) 
-            all_lanes.extend(list(traci.trafficlight.getControlledLanes(junction)))
-
-        while step <= steps:
-            traci.simulationStep()
-            for junction_number, junction in enumerate(all_junctions):
-                controled_lanes = traci.trafficlight.getControlledLanes(junction)
-                waiting_time = get_waiting_time(controled_lanes)
-                total_time += waiting_time
-                if traffic_lights_time[junction] == 0:
-                    vehicles_per_lane = get_vehicle_numbers(controled_lanes)
-                    # vehicles_per_lane = get_vehicle_numbers(all_lanes)
-
-                    #storing previous state and current state
-                    reward = -1 *  waiting_time
-                    state_ = list(vehicles_per_lane.values()) 
-                    state = prev_vehicles_per_lane[junction_number]
-                    prev_vehicles_per_lane[junction_number] = state_
-                    brain.store_transition(state, state_, prev_action[junction_number],reward,(step==steps),junction_number)
-
-                    #selecting new action based on current state
-                    lane = brain.choose_action(state_)
-                    prev_action[junction_number] = lane
-                    phaseDuration(junction, 6, select_lane[lane][0])
-                    phaseDuration(junction, min_duration + 10, select_lane[lane][1])
-
-                    if ard:
-                        ph = str(traci.trafficlight.getPhase("0"))
-                        value = write_read(ph)
-
-                    traffic_lights_time[junction] = min_duration + 10
-                    if train:
-                        brain.learn(junction_number)
-                else:
-                    traffic_lights_time[junction] -= 1
-            step += 1
-        
-        total_time_list.append(total_time)
-
-        if total_time < best_time:
-            best_time = total_time
-            if train:
-                brain.save(model_name)
-                mlflow.pytorch.log_model(brain.Q_eval, artifact_path="models")
-                mlflow.register_model(f"runs:/{mlflow.active_run().info.run_id}/models", "TrafficLightModel")
-                print(f"New model registered with time: {total_time}")
-                # mlflow.sklearn.log_model(model, "model")  # Log new model version to MLflow
-                
-
-        traci.close()
-        sys.stdout.flush()
+    if historical and train:
+        train_historical(brain, model_name)
+    else:
         if not train:
-            mlflow.log_metric("evaluation_time", total_time)
-            print("total_time",total_time)
-            return total_time
-    if train:
-        plt.plot(list(range(len(total_time_list))),total_time_list)
-        plt.xlabel("epochs")
-        plt.ylabel("total time")
-        plt.savefig(f'plots/time_vs_epoch_{model_name}.png')
-        plt.show()
+            brain.Q_eval = mlflow.pytorch.load_model("models:/TrafficLightModel/latest")
+            # brain.Q_eval.load_state_dict(torch.load(f'models/{model_name}.bin',map_location=brain.Q_eval.device))
+
+        
+        for e in range(epochs):
+            if train:
+                traci.start(
+                [checkBinary("sumo"), "-c", "configuration.sumocfg", "--tripinfo-output", "tripinfo.xml"]
+                )
+            else:
+                traci.start(
+                [checkBinary("sumo"), "-c", "configuration.sumocfg", "--tripinfo-output", "tripinfo.xml"]
+                )
+
+            print(f"epoch: {e}")
+            select_lane = [
+                ["yyyrrrrrrrrr", "GGGrrrrrrrrr"],
+                ["rrryyyrrrrrr", "rrrGGGrrrrrr"],
+                ["rrrrrryyyrrr", "rrrrrrGGGrrr"],
+                ["rrrrrrrrryyy", "rrrrrrrrrGGG"],
+            ]
+
+            # select_lane = [
+            #     ["yyyyrrrrrrrrrrrr", "GGGGrrrrrrrrrrrr"],
+            #     ["rrrryyyyrrrrrrrr", "rrrrGGGGrrrrrrrr"],
+            #     ["rrrrrrrryyyyrrrr", "rrrrrrrrGGGGrrrr"],
+            #     ["rrrrrrrrrrrryyyy", "rrrrrrrrrrrrGGGG"],
+            # ]
+
+            step = 0
+            total_time = 0
+            min_duration = 5
+            
+            traffic_lights_time = dict()
+            prev_wait_time = dict()
+            prev_vehicles_per_lane = dict()
+            prev_action = dict()
+            all_lanes = list()
+            
+            for junction_number, junction in enumerate(all_junctions):
+                prev_wait_time[junction] = 0
+                prev_action[junction_number] = 0
+                traffic_lights_time[junction] = 0
+                prev_vehicles_per_lane[junction_number] = [0] * 4
+                # prev_vehicles_per_lane[junction_number] = [0] * (len(all_junctions) * 4) 
+                all_lanes.extend(list(traci.trafficlight.getControlledLanes(junction)))
+
+            while step <= steps:
+                traci.simulationStep()
+                for junction_number, junction in enumerate(all_junctions):
+                    controled_lanes = traci.trafficlight.getControlledLanes(junction)
+                    waiting_time = get_waiting_time(controled_lanes)
+                    total_time += waiting_time
+                    if traffic_lights_time[junction] == 0:
+                        vehicles_per_lane = get_vehicle_numbers(controled_lanes)
+                        # vehicles_per_lane = get_vehicle_numbers(all_lanes)
+
+                        #storing previous state and current state
+                        reward = -1 *  waiting_time
+                        state_ = list(vehicles_per_lane.values()) 
+                        state = prev_vehicles_per_lane[junction_number]
+                        prev_vehicles_per_lane[junction_number] = state_
+                        brain.store_transition(state, state_, prev_action[junction_number],reward,(step==steps),junction_number, model_name)
+
+                        #selecting new action based on current state
+                        lane = brain.choose_action(state_)
+                        prev_action[junction_number] = lane
+                        phaseDuration(junction, 6, select_lane[lane][0])
+                        phaseDuration(junction, min_duration + 10, select_lane[lane][1])
+
+                        if ard:
+                            ph = str(traci.trafficlight.getPhase("0"))
+                            value = write_read(ph)
+
+                        traffic_lights_time[junction] = min_duration + 10
+                        if train:
+                            brain.learn(junction_number)
+                    else:
+                        traffic_lights_time[junction] -= 1
+                step += 1
+            
+            total_time_list.append(total_time)
+
+            if total_time < best_time:
+                best_time = total_time
+                if train:
+                    brain.save(model_name)
+                    mlflow.pytorch.log_model(brain.Q_eval, artifact_path="models")
+                    mlflow.register_model(f"runs:/{mlflow.active_run().info.run_id}/models", "TrafficLightModel")
+                    print(f"New model registered with time: {total_time}")
+                    # mlflow.sklearn.log_model(model, "model")  # Log new model version to MLflow
+                    
+
+            traci.close()
+            sys.stdout.flush()
+            if not train:
+                mlflow.log_metric("evaluation_time", total_time)
+                print("total_time",total_time)
+                return total_time
+        if train:
+            plt.plot(list(range(len(total_time_list))),total_time_list)
+            plt.xlabel("epochs")
+            plt.ylabel("total time")
+            plt.savefig(f'plots/time_vs_epoch_{model_name}.png')
+            plt.show()
 
 def get_options():
     optParser = optparse.OptionParser()
@@ -360,7 +438,7 @@ def get_options():
         help="Number of steps",
     )
     optParser.add_option(
-       "--ard",
+    "--ard",
         action='store_true',
         default=False,
         help="Connect Arduino", 
@@ -384,7 +462,6 @@ if __name__ == "__main__":
         while True:
           tpt = run(train=train,model_name=uuid.uuid4(),epochs=epochs,steps=steps,ard=ard)
           if tpt > METRIC_THRESHOLD:
-            print("Model time fall below thresh hold. Retraining.......")
-            run(train=True,model_name=uuid.uuid4(),epochs=epochs,steps=steps,ard=ard)  # Replace with your actual training function
-            print("Model retrained and logged successfully.")
+            run(train=True,model_name=uuid.uuid4(),epochs=epochs,steps=steps,ard=ard,historical=True)  # Replace with your actual training function
+            
 
