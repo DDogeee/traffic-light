@@ -449,6 +449,9 @@ def get_options():
 
 # this is the main entry point of this script
 if __name__ == "__main__":
+
+    if not os.path.exists("data"):
+        os.mkdir("data")
     options = get_options()
     model_name = options.model_name
     train = options.train
