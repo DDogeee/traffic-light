@@ -401,12 +401,13 @@ def run(train=True,model_name="model",epochs=50,steps=500,ard=False, historical 
                 mlflow.log_metric("evaluation_time", total_time)
                 print("total_time",total_time)
                 return total_time
-        if train:
-            plt.plot(list(range(len(total_time_list))),total_time_list)
-            plt.xlabel("epochs")
-            plt.ylabel("total time")
-            plt.savefig(f'plots/time_vs_epoch_{model_name}.png')
-            plt.show()
+        
+        plt.plot(list(range(len(total_time_list))),total_time_list)
+        plt.xlabel("epochs")
+        plt.ylabel("total time")
+        plt.savefig(f'plots/time_vs_epoch_{model_name}.png')
+        print(f"plot save at plots/time_vs_epoch_{model_name}.png")
+        # plt.show()
 
 def get_options():
     optParser = optparse.OptionParser()
@@ -462,9 +463,11 @@ if __name__ == "__main__":
     if train:
       run(train=train,model_name=uuid.uuid4(),epochs=epochs,steps=steps,ard=ard)
     else:
+        start = datetime.now()
         while True:
           tpt = run(train=train,model_name=uuid.uuid4(),epochs=epochs,steps=steps,ard=ard)
-          if tpt > METRIC_THRESHOLD:
-            run(train=True,model_name=uuid.uuid4(),epochs=epochs,steps=steps,ard=ard,historical=True)  # Replace with your actual training function
+          if ((datetime.now()-start).seconds > T) or ((tpt/last_infer) > p):
+            last_infer = run(train=True,model_name=uuid.uuid4(),epochs=epochs,steps=steps,ard=ard,historical=True)  # Replace with your actual training function
+            start = datetime.now()
             
 
